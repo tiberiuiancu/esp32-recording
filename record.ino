@@ -87,13 +87,11 @@ bool openWavFile() {
     Serial.printf("Opening %s\n", name);
     file = SD.open(name, FILE_WRITE);
     if (!file) return false;
-    for (int i = 0; i < 44; i++)
-        file.write((uint8_t)0);
+    writeWavHeader(0xFFFFFFFF);
     return true;
 }
 
 void closeWavFile() {
-    writeWavHeader(dataSize);
     file.close();
     Serial.printf("Closed (%u bytes)\n", dataSize);
     dataSize = 0;
@@ -160,7 +158,7 @@ void writeTask(void *pvParameters) {
 
 void readTask(void *pvParameters) {
     int start = millis();
-    while (millis() - start <= 20000) {
+    while (millis() - start <= 10000) {
         size_t readStart = ((lastRead + 1) * CHUNK_SIZE) % bufferSize;
         size_t bytesRead;
         i2s_read(I2S_NUM_0, buffer + readStart, CHUNK_SIZE, &bytesRead, portMAX_DELAY);
