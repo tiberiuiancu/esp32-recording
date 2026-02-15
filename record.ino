@@ -25,22 +25,17 @@
 
 const size_t bufferSize = N_CHUNKS * CHUNK_SIZE;
 uint8_t buffer[bufferSize];
-volatile int lastRead = -1;
-volatile int lastWritten = -1;
+volatile int lastRead = N_CHUNKS - 1;
+int lastWritten = N_CHUNKS - 1;
 
-File files[2];
-int idx;
-
-volatile int curr = -1;
-volatile int prev = -1;
-volatile int next = -1;
-
-volatile uint32_t dataSize = 0;
-volatile uint32_t prevFileSize = 0;
+File file;
+uint32_t dataSize = 0;
+int fileCounter = 0;
+volatile bool recording = true;
 
 const int BUTTON_PIN = 0;
 
-void writeWavHeader(File file, uint32_t dataSize) {
+void writeWavHeader(uint32_t dataSize) {
     uint32_t fileSize = dataSize + 36;
     uint32_t byteRate = SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8);
     uint16_t blockAlign = CHANNELS * (BITS_PER_SAMPLE / 8);
@@ -58,7 +53,7 @@ void writeWavHeader(File file, uint32_t dataSize) {
 
     file.write(fmt, 4);
     uint32_t subChunk1Size = 16;
-    uint16_t audioFormat = 1; // PCM
+    uint16_t audioFormat = 1;
     uint16_t channels = CHANNELS;
     uint32_t sampleRate = SAMPLE_RATE;
     uint16_t bitsPerSample = BITS_PER_SAMPLE;
@@ -75,94 +70,97 @@ void writeWavHeader(File file, uint32_t dataSize) {
     file.write((uint8_t *)&dataSize, 4);
 }
 
-String getNextFileName() {
+void initFileCounter() {
     char name[12];
     for (int i = 1; i <= 9999; i++) {
         sprintf(name, "/%04d.wav", i);
         if (!SD.exists(name)) {
-            return String(name);
+            fileCounter = i;
+            return;
         }
     }
-    return String();
 }
 
-int openWavFile(const char* name) {
-    String autoName;
-    if (name == NULL) {
-        autoName = getNextFileName();
-        name = autoName.c_str();
-    }
-    files[idx] = SD.open(name, FILE_WRITE);
-    if (!files[idx]) {
-        return -1;
-    }
+bool openWavFile() {
+    char name[12];
+    sprintf(name, "/%04d.wav", fileCounter++);
+    Serial.printf("Opening %s\n", name);
+    file = SD.open(name, FILE_WRITE);
+    if (!file) return false;
     for (int i = 0; i < 44; i++)
-        files[idx].write((uint8_t)0);
-    idx = !idx;
-    return !idx;
+        file.write((uint8_t)0);
+    return true;
+}
+
+void closeWavFile() {
+    writeWavHeader(dataSize);
+    file.close();
+    Serial.printf("Closed (%u bytes)\n", dataSize);
+    dataSize = 0;
 }
 
 void writeTask(void *pvParameters) {
     esp_task_wdt_add(NULL);
 
+    if (!openWavFile()) {
+        Serial.println("Could not open file");
+        while (1) {}
+    }
+    Serial.println("Starting recording");
+
     while (1) {
         if (lastRead == lastWritten) {
+            if (!recording) {
+                closeWavFile();
+                Serial.println("done");
+                while (1) { esp_task_wdt_reset(); }
+            } else if (dataSize >= FILE_SIZE_LIMIT) {
+                // only move to new file if we've caught up to writing all the buffers
+                closeWavFile();
+                if (!openWavFile()) {
+                    Serial.println("Could not open file");
+                    while (1) {}
+                }
+            }
+
             vTaskDelay(1 / portTICK_PERIOD_MS);
             esp_task_wdt_reset();
             continue;
         }
-        int startChunk = lastWritten + 1;
-        int endChunk = lastRead <= lastWritten ? N_CHUNKS - 1 : lastRead;
+
+        int startChunk = (lastWritten + 1) % N_CHUNKS;
+        int endChunk = (startChunk <= lastRead) ? lastRead : N_CHUNKS - 1;
 
         int writeStart = startChunk * CHUNK_SIZE;
-        int writeEnd = (endChunk + 1) * CHUNK_SIZE;
-        int writeSize = writeEnd - writeStart;
+        int writeSize = (endChunk - startChunk + 1) * CHUNK_SIZE;
 
-        size_t wrote = files[curr].write(buffer + writeStart, writeSize);
-        dataSize += writeSize;
-        lastWritten = endChunk == N_CHUNKS - 1 ? -1 : endChunk;
-
-        if (next != -1) {
-            prevFileSize = dataSize;
-            dataSize = 0;
-            prev = curr;
-            curr = next;
-            next = -1;
-            __sync_synchronize();
+        size_t wrote = file.write(buffer + writeStart, writeSize);
+        if (wrote == 0) {
+            Serial.println("SD write failed, retrying...");
+            int retries = 3;
+            while (wrote == 0 && retries-- > 0) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+                wrote = file.write(buffer + writeStart, writeSize);
+            }
+            if (wrote == 0) {
+                Serial.println("SD write failed, closing file");
+                closeWavFile();
+                if (!openWavFile()) {
+                    Serial.println("Could not open new file");
+                    while (1) {}
+                }
+            }
         }
+        dataSize += wrote;
+        lastWritten = endChunk;
 
         esp_task_wdt_reset();
     }
 }
 
 void readTask(void *pvParameters) {
-    curr = openWavFile(NULL);
-    if (curr == -1) {
-        Serial.println("Could not open file");
-        while (1) {}
-    }
-    dataSize = 0;
-    Serial.println("Starting recording");
-
     int start = millis();
     while (millis() - start <= 20000) {
-        if (dataSize >= FILE_SIZE_LIMIT && next == -1) {
-            Serial.println("Writing to new file");
-            next = openWavFile(NULL);
-            Serial.printf("Writing at index %d\n", next);
-            if (next == -1) {
-                Serial.println("Could not open file");
-                while (1) {}
-            }
-        }
-
-        if (prevFileSize && prev != -1) {
-            writeWavHeader(files[prev], prevFileSize);
-            files[prev].close();
-            prev = -1;
-            prevFileSize = 0;
-        }
-
         size_t readStart = ((lastRead + 1) * CHUNK_SIZE) % bufferSize;
         size_t bytesRead;
         i2s_read(I2S_NUM_0, buffer + readStart, CHUNK_SIZE, &bytesRead, portMAX_DELAY);
@@ -172,15 +170,9 @@ void readTask(void *pvParameters) {
         }
     }
 
-    // wait for writing to finish
-    while (lastRead != lastWritten) {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-
-    writeWavHeader(files[curr], dataSize);
-    files[curr].close();
-    Serial.println("done");
-    while(1);
+    recording = false;
+    Serial.println("Read task finished");
+    while (1) { vTaskDelay(20 / portTICK_PERIOD_MS); esp_task_wdt_reset();}
 }
 
 void setup() {
@@ -197,6 +189,8 @@ void setup() {
         while (1)
             ;
     }
+
+    initFileCounter();
 
     i2s_config_t i2s_config = {.mode =
                                    (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX),
@@ -220,25 +214,24 @@ void setup() {
     i2s_set_pin(I2S_NUM_0, &pin_config);
     i2s_zero_dma_buffer(I2S_NUM_0);
 
-    // Create tasks
     TaskHandle_t Task1;
-    xTaskCreatePinnedToCore(writeTask, // Task function
-                            "write",   // Name
-                            8192,      // Stack size (words)
-                            NULL,      // Parameters
-                            1,         // Priority
-                            &Task1,    // Task handle
-                            0          // Core (0 or 1)
+    xTaskCreatePinnedToCore(writeTask,
+                            "write",
+                            8192,
+                            NULL,
+                            1,
+                            &Task1,
+                            0
     );
 
     TaskHandle_t Task2;
-    xTaskCreatePinnedToCore(readTask, // Task function
-                            "read",   // Name
-                            4096,     // Stack size (words)
-                            NULL,     // Parameters
-                            1,        // Priority
-                            &Task2,   // Task handle
-                            1         // Core (0 or 1)
+    xTaskCreatePinnedToCore(readTask,
+                            "read",
+                            4096,
+                            NULL,
+                            1,
+                            &Task2,
+                            1
     );
 
     Serial.println("Setup done");
