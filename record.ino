@@ -21,7 +21,8 @@
 #define N_CHUNKS 64
 #define CHUNK_SIZE 512
 
-#define FILE_SIZE_LIMIT 2000000
+// 1GB
+#define FILE_SIZE_LIMIT 1000000000
 
 const size_t bufferSize = N_CHUNKS * CHUNK_SIZE;
 uint8_t buffer[bufferSize];
@@ -105,6 +106,7 @@ void writeTask(void *pvParameters) {
         while (1) {}
     }
     Serial.println("Starting recording");
+    digitalWrite(2, HIGH);
 
     while (1) {
         if (lastRead == lastWritten) {
@@ -158,7 +160,7 @@ void writeTask(void *pvParameters) {
 
 void readTask(void *pvParameters) {
     int start = millis();
-    while (millis() - start <= 10000) {
+    while (1) {
         size_t readStart = ((lastRead + 1) * CHUNK_SIZE) % bufferSize;
         size_t bytesRead;
         i2s_read(I2S_NUM_0, buffer + readStart, CHUNK_SIZE, &bytesRead, portMAX_DELAY);
@@ -167,10 +169,6 @@ void readTask(void *pvParameters) {
             lastRead = (lastRead + 1) % N_CHUNKS;
         }
     }
-
-    recording = false;
-    Serial.println("Read task finished");
-    while (1) { vTaskDelay(20 / portTICK_PERIOD_MS); esp_task_wdt_reset();}
 }
 
 void setup() {
